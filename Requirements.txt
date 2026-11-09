@@ -1,4 +1,7 @@
-pandas
-numpy 
-scipy
-yfinance
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+yfinance>=0.2.40
+matplotlib>=3.7
+arch>=7.0
+pytest>=8.0

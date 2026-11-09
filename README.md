@@ -1,134 +1,62 @@
+# Empirical Sortino portfolio optimization
 
-Portfolio Optimization with Sortino Index. v.0.1
-================================================
+Python research utilities for constrained portfolio allocation, plus an experimental pairs-trading module.
 
-Contents
-========
+## Install and test
 
-* [Just for fun](#just-for-fun)
-* [A walkthrough in the PortofolioOptimization class](#a-walkthrough-in-the-portofoliooptimization-class)
-	* [Import the class](#import-the-class)
-	* [Import the list of financial products](#import-the-list-of-financial-products)
-	* [Run the Portfolio Analysis](#run-the-portfolio-analysis)
-	* [Input the initial capital](#input-the-initial-capital)
-	* [Final weights](#final-weights)
-	* [Rebalance portofolio weights](#rebalance-portofolio-weights)
-	* [Rebalanced weights](#rebalanced-weights)
-* [PortfolioOptimization class features](#portfoliooptimization-class-features)
-* [Have fun!](#have-fun)
+Use Python 3.11 or 3.12 from the repository root:
 
-# Just for fun
+```sh
+python -m pip install -r Requirements.txt
+python -m pytest -q
+```
 
+Tests use synthetic returns and mocked downloads, so they do not require network access or current market data. GitHub Actions runs the same numerical checks on Python 3.11 and 3.12. `arch` is needed for cointegration in the optional pairs module; it is imported only when that functionality is called.
 
-This file contains a brief overview of an active strategy of portfolio optimization based on Sortino index maximization and Student-t data generating process.
-
-The classes in current repository allow for weights computation based on daily observations and any time interval specified in the format 'yy-mm-dd'. In particular: 
-- Optimal weights
-- Initial Capital
-- Capital rebalancing
-- Transaction costs as a percentage (%) of returns.
-
-
-
-# A walkthrough in the PortofolioOptimization class
-
-## Import the class
-
-
-Import packages suit your project together with the PortofolioOptimization class.
+## Allocation example
 
 ```python
-# Import packages 
 from Maximization import PortfolioOptimization
+
+assets = ['TAN', 'QCLN', 'CNRG', 'SMOG', 'ICLN', 'ACES', 'PBD', 'PBW', 'FAN', 'NZAC']
+portfolio = PortfolioOptimization(assets, ['2022-05-01', '2022-06-01'], allow_for_short=False, tc=.01)
+weights = portfolio.Results.result_max.x  # dimensionless, sum to one
+amounts = portfolio.FinalWeights        # currency allocations after the capital prompt
 ```
-## Import the list of financial products
 
+Long-only bounds are [0,1], which permits the ten-asset example. Short-enabled bounds are [-1,2], with net weights summing to one and gross exposure `sum(abs(weights)) <= 2`. These are explicit research constraints, not an automatic choice of leverage for a real account. Optimizer failures and zero-downside portfolios raise errors instead of returning apparently valid allocations. SLSQP finds a local solution; global optimality is not established.
 
-Take the list of symbols from the list of financial products availables on Yahoo Finance.
-For example, trending tickers:  https://finance.yahoo.com/lookup
+To work without downloads or a capital prompt:
 
 ```python
-# Select a list of Green ETFs as specified on https://finance.yahoo.com
-ETF_list = ['TAN', 'QCLN', 'CNRG', 'SMOG', 'ICLN', 'ACES', 'PBD', 'PBW', 'FAN', 'NZAC']
+import pandas as pd
+from Maximization import Maximization
+
+returns = pd.DataFrame({'A': [.02, -.01, .01, -.02],
+                        'B': [.01, -.02, .02, -.01],
+                        'risk_free': [.0001] * 4})
+result = Maximization({}, returns, allow_for_short=False, tc=0).result_max
 ```
-## Run the Portfolio Analysis
 
+The last column is always a **daily** risk-free return; preceding columns are simple daily risky-asset returns. For weights w, the objective is the negative sample mean of net excess returns divided by `sqrt(mean(min(net_excess, 0)**2))`. It uses realized portfolio downside, not the covariance of a covariance matrix or an ad hoc Student-t inflation. Student-t fits in `StockRanking` remain descriptive diagnostics and do not change this objective.
 
-In order to run the class successfully, the following inputs must be specified:
-- At least two stock symbols and date range in 'yy-mm-dd' format
-- A boolean 'allow_for_shorting' is set to default to 'False'
-- A value 'tc' between 0 and 1, as a fixed percentage of returns. It is set to default to 0.01.
+`tc` is a fraction in [0,1) applied as a haircut to positive daily portfolio returns before subtracting the daily risk-free return. It is **not** a brokerage fee on turnover. Modeling turnover fees requires previous holdings and a separate cost model. Both shorting branches use the supplied `tc` unchanged.
 
+## Price alignment
 
+`ImportData` explicitly selects adjusted Close prices in requested ticker order and computes percentage changes, rather than price differences. The ^TNX annual percentage yield is converted using `(1 + yield/100)**(1/252) - 1`, with the previous available observation used for the current interval. ^TNX is a ten-year yield proxy, not a realized daily cash-account return. Use an appropriate externally prepared risk-free series for substantive research.
+
+## Rebalancing
+
+```python
+next_portfolio = PortfolioOptimization(
+    assets, ['2022-06-01', '2022-07-01'], rebalance=True,
+    rebalance_capital=portfolio.capital, rebalance_weights=portfolio.FinalWeights
+)
 ```
-# Include the ETF_list and the timespan of interest.
-OptimizedPortfolio = PortfolioOptimization(ETF_list, ['2022-05-01', '2022-05-31'])
-```
-## Input the initial capital
 
+`FinalWeights` retains its legacy name but contains currency amounts; `Results.result_max.x` contains proportions. Rebalancing assumes the supplied capital and holdings are already marked to the desired rebalance date.
 
-When running the class with the 'rebalance' set to False, the workflow of the classwill return the following message:
+## Scope of the evidence
 
-
-*'To maximize the excessive returns with the current set of financial products, specify the initial capital: '*
-
-
-
-**IMPORTANT**: Specify the initial capital with plain ciphers - neither commas nor other special characters.
-## Final weights
-
-
-Depending on whether the boolean 'allow_for_short' is set to 'True' or not, the workflow of the classwill return the following message:
-
-
-***'With leverage, you should invest this month respectively: xxx euros.'***
-
-
-
-***'With no leverage, you should invest this month respectively: xxx euros.'***
-
-
-## Rebalance portofolio weights
-
-
-To rebalance the portfolio, run again the Portfolio optimization at t=2.
-Activate the rebalance mode by setting:
-- The boolean 'rebalance' to True. The default is False.
-- The 'rebalance_capital' equal to the capital of the previous optimization.
-- The 'rebalance_weights' equal to the weights of the previous optimization
-
-
-```
-# Include the ETF_list and the timespan of interest and the elements specified above
-PortfolioOptimization(ETF_list, ['2022-06-01', '2022-06-30'], rebalance=True, 
-rebalance_capital=OptimizedPortfolio.capital,
-rebalance_weights=OptimizedPortfolio.FinalWeights)
-```
-## Rebalanced weights
-
-
-The current mode of the class will return the following messages:
-
-
-***'With leverage, you should add/subtract to the previous portfolio weights respectively:: xxx euros.'***
-
-
-
-***'With no leverage, you should add/subtract to the previous portfolio weights respectively:: xxx euros.'***
-
-
-# PortfolioOptimization class features
-
-
-The current version of the class allows to call the following object properties:
-
-- PortfolioOptimization.capital: float, initial capital specified by the user
-- PortfolioOptimization.FinalWeights: ndarray, array of portfolio weights.
-- PortfolioOptimization.Results: class OptimizeResult from Scipy library, class containing all the relevant attributes of the maximization
-
-
-The class runs with a SLSQP maximization algorithm and linear constraint imposed on the weights.The other requirements for this class to run are contained in 'requirements.txt'.
-# Have fun!
-
-
-In case you want to discuss this code further, feel free to reach me following the link on my GitHub profile.
+Regression checks cover feasibility for ten assets, actual negative positions, gross exposure, the objective against hand calculations, cost handling, return ordering, daily-rate conversion, and error handling. They do not establish out-of-sample investment performance. No transaction-cost-aware backtest or execution system is provided. The pairs-trading code remains an exploratory in-sample heuristic; its signals are not evidence of a profitable or causally valid strategy. Historical results must be rerun after the return and objective corrections.
