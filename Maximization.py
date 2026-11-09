@@ -8,11 +8,11 @@ import warnings
 import matplotlib.pyplot as plt
 
 # Warnings
-warnings.filterwarnings("ignore")
+
 
 # Import global statement
 from statistics import mean
-from arch.unitroot.cointegration import phillips_ouliaris
+
 from scipy.stats import t
 from scipy.optimize import minimize, LinearConstraint
 
@@ -100,78 +100,84 @@ class PortfolioOptimization:
 
 
 class Maximization:
+    """Maximize the empirical daily Sortino ratio under explicit weight bounds.
+
+    The legacy ``shares`` argument is retained for compatibility; Student-t
+    fits are descriptive and do not modify the empirical downside deviation.
+    ``tc`` is a haircut on positive daily portfolio returns, not turnover fees.
+    """
+
     def __init__(self, shares: dict, returns: pd.DataFrame, allow_for_short=True, tc=0.01):
-        # Define initial conditions for maximization
         self.result_max = None
-        weights = np.array([[0.1] * (returns.shape[1] - 1)]).transpose()
-        self.maximization_problem(weights, returns, shares, allow_for_short=allow_for_short, tc=tc)
+        weights = np.full(returns.shape[1] - 1, 1 / (returns.shape[1] - 1))
+        self.maximization_problem(weights, returns, shares, allow_for_short, tc)
 
-    def maximization_problem(self, weights: np.array, returns: pd.DataFrame, shares: dict, allow_for_short=True,
-                             tc=0.01):
-
-        # Define constraints
-        # Matrix constraint
-        A = np.ones([1, weights.shape[0]])
-
-        # Upper and lower bound equal => equality constraint
-        ub_lb = np.ones(1)
-
-        # Call class linear constraint
-        C = LinearConstraint(A, ub_lb, ub_lb)
-
-        # Impose bound on weights depending on boolean: "allow_for_short".
+    def maximization_problem(self, weights, returns, shares, allow_for_short=True, tc=0.01):
+        values = returns.to_numpy(dtype=float)
+        if values.ndim != 2 or values.shape[0] < 2 or values.shape[1] < 2 or not np.isfinite(values).all():
+            raise ValueError("returns must contain finite observations, risky assets and a final daily risk-free column")
+        if not np.isfinite(tc) or not 0 <= tc < 1:
+            raise ValueError("tc must be in [0, 1)")
+        n_assets = values.shape[1] - 1
+        initial = np.asarray(weights, dtype=float).reshape(-1)
+        if initial.shape != (n_assets,) or not np.isfinite(initial).all():
+            raise ValueError("Initial weights must match the number of risky assets")
+        bounds = [(-1., 2.) if allow_for_short else (0., 1.)] * n_assets
+        constraints = [{'type': 'eq', 'fun': lambda w: w.sum() - 1.}]
         if allow_for_short:
-            bounds = [(0.2, 0.9)] * weights.shape[0]
-            self.result_max = minimize(fun=self.maximand_function, x0=weights, args=(returns, shares, allow_for_short),
-                                       method='SLSQP', bounds=bounds,
-                                       constraints=C)
-
-        else:
-            bounds = [(0.2, 0.9)] * weights.shape[0]
-            self.result_max = minimize(fun=self.maximand_function, x0=weights, args=(returns, shares, tc),
-                                       method='SLSQP', bounds=bounds,
-                                       constraints=C)
+            # Net investment remains one; gross exposure is capped at two.
+            constraints.append({'type': 'ineq', 'fun': lambda w: 2. - np.abs(w).sum()})
+        result = minimize(self.maximand_function, initial, args=(returns, shares, tc),
+                          method='SLSQP', bounds=bounds, constraints=constraints,
+                          options={'maxiter': 1000, 'ftol': 1e-10})
+        if not result.success or not np.isfinite(result.fun):
+            raise RuntimeError(f"Portfolio optimization failed: {result.message}")
+        if abs(result.x.sum() - 1.) > 1e-6 or (allow_for_short and np.abs(result.x).sum() > 2. + 1e-6):
+            raise RuntimeError("Optimizer returned infeasible weights")
+        portfolio = values[:, :-1] @ result.x
+        excess = portfolio - tc * np.maximum(portfolio, 0.) - values[:, -1]
+        if np.sqrt(np.mean(np.minimum(excess, 0.) ** 2)) <= 1e-12:
+            raise ValueError("Optimal portfolio has zero empirical downside deviation; its Sortino ratio is undefined")
+        self.result_max = result
+        return result
 
     @staticmethod
-    def maximand_function(weights: np.array, returns: pd.DataFrame, shares: dict, tc=0.01):
-
-        # Define the excess returns with respect to the risk-free
-        diff = returns.to_numpy()[:, :-1] - returns.to_numpy()[:, -1].reshape([returns.to_numpy()[:, -1].shape[0], 1])
-
-        # Define the excess negative returns
-        diff_min = returns[returns < 0].iloc[:, :-1].to_numpy() - returns.iloc[:, -1].to_numpy().reshape(
-            [returns.to_numpy()[:, -1].shape[0], 1])
-
-        # Extract the variance-covariance matrix
-        var_cov = np.ma.cov(np.ma.masked_invalid(diff_min.transpose()))
-
-        # Expand dimension of weights matrix
-        weights = weights[:, np.newaxis]
-
-        # Define the maximand function as a linear combination Sortino Ratio with t-Student Nuisances
-        arg = - (1 - tc) * diff.mean(axis=0).reshape(
-            [returns.iloc[:, :-1].shape[1], 1]).transpose() @ weights @ np.linalg.inv(
-            weights.transpose() @ np.multiply(
-                mean(shares['dof']) / (mean(shares['dof']) - 2),
-                np.cov(np.ma.getdata(var_cov))) @ weights)
-        return arg
+    def maximand_function(weights, returns, shares=None, tc=0.01):
+        values = returns.to_numpy(dtype=float)
+        portfolio = values[:, :-1] @ np.asarray(weights).reshape(-1)
+        net_excess = portfolio - tc * np.maximum(portfolio, 0.) - values[:, -1]
+        downside = np.sqrt(np.mean(np.minimum(net_excess, 0.) ** 2))
+        if downside <= 1e-12:
+            raise ValueError("Portfolio has zero empirical downside deviation; its Sortino ratio is undefined")
+        return float(-net_excess.mean() / downside)
 
 
 class ImportData:
+    """Adjusted simple daily returns with a daily rate derived from ^TNX.
+
+    ^TNX is an annualized percentage yield proxy, not a tradable cash account.
+    The prior observation is converted on a 252-trading-day convention.
+    """
+
     def __init__(self, StockMnemonics: list, period: list):
-        # Add the risk-free interest rate mnemonic symbol
-        RiskFreeMnemonics = ['^TNX']  # Treasury Yield 10 Years
-        StockMnemonics = StockMnemonics + RiskFreeMnemonics
-
-        # Download the mnemonics specified by the user
-        self.dataframe = yf.download(" ".join(StockMnemonics), start=period[0], end=period[1])
-        self.returns = self.dataframe.iloc[:, :len(StockMnemonics) - 1].diff().dropna().assign(
-            RiskFree=self.dataframe.iloc[1:, len(StockMnemonics) - 1])
-        self.returns.columns = StockMnemonics
-
-        # Redefine the columns
-        self.prices = self.dataframe.iloc[:, :len(StockMnemonics)]
-        self.prices.columns = StockMnemonics
+        symbols = list(StockMnemonics)
+        if not symbols or len(set(symbols)) != len(symbols) or '^TNX' in symbols:
+            raise ValueError("Provide unique risky-asset tickers without ^TNX")
+        raw = yf.download(symbols + ['^TNX'], start=period[0], end=period[1], auto_adjust=True)
+        try:
+            close = raw['Close'].reindex(columns=symbols + ['^TNX']).astype(float)
+        except (KeyError, AttributeError) as error:
+            raise ValueError("Price data must contain a Close column for each requested ticker") from error
+        close = close.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(close) < 3 or (close[symbols] <= 0).any().any():
+            raise ValueError("At least three aligned positive price observations are required")
+        if (close['^TNX'] <= -100).any():
+            raise ValueError("Annual yield must exceed -100 percent")
+        self.prices = close[symbols]
+        self.dataframe = close
+        returns = close[symbols].pct_change(fill_method=None)
+        daily_risk_free = np.expm1(np.log1p(close['^TNX'].shift(1) / 100.) / 252.)
+        self.returns = returns.assign(**{'^TNX': daily_risk_free}).dropna()
 
 
 class StockRanking:
@@ -248,7 +254,10 @@ class PairTrading:
               "\n the portfolio optimization was implemented in seconds:", np.round(stop - start, 2), ".\n", "-" * 400)
 
     def save_results(self, prices: pd.DataFrame, path="Signals.png"):
-        Signals, axs = plt.subplots(len(self.cointegrated_pairs), 1, figsize=(10, 8))
+        if not self.cointegrated_pairs:
+            return
+        Signals, axes = plt.subplots(len(self.cointegrated_pairs), 1, figsize=(10, 8), squeeze=False)
+        axs = axes[:, 0]
 
         for j in range(len(self.cointegrated_pairs)):
             axs[j].plot(prices[self.cointegrated_pairs[j]])
@@ -290,6 +299,7 @@ class PairTrading:
                 raise Warning("This set of variables does not allow Pairs-trading. Financial variables overlap.")
 
         self.estimated = signal
+        return signal
 
     @staticmethod
     def computation_utils(Shares_higher: pd.DataFrame,
@@ -304,7 +314,7 @@ class PairTrading:
         # Compute moving averages rather than fixed ones
         ratios_mavg5 = S2.rolling(window=windows[0], center=False).mean()
         ratios_mavg60 = S2.rolling(window=windows[1], center=False).mean()
-        std_60 = S2.rolling(window=windows[1], center=False).std(doff=1)
+        std_60 = S2.rolling(window=windows[1], center=False).std(ddof=1)
         zscore_60_5 = (ratios_mavg5 - ratios_mavg60) / std_60
 
         # Thresholds
@@ -337,6 +347,8 @@ class PairTrading:
 
     @staticmethod
     def cointegration(prices: pd.DataFrame, combine_coint: list, significance=0.05):
+
+        from arch.unitroot.cointegration import phillips_ouliaris
 
         # Perform cointegration matrix
         cointegration_matrix = []
